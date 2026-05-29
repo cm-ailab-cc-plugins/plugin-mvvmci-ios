@@ -33,8 +33,11 @@ AppCoordinator → Coordinator → ViewController → ViewModel → Interactor
 
 ### 2. 狀態所有權
 
-- **Interactor** 以 `@Published` 持有業務狀態，protocol 介面透過 `Published<>.Publisher` 暴露（因為 protocol 不支援 `@Published`）
-- **ViewModel** 持有 `@Published` 顯示狀態，訂閱 Interactor 的 Publisher 並轉換為 View 所需資料
+- **Interactor** 是所有資料來源（data source）的擁有者：API 回傳的資料、業務狀態都在 Interactor 以 `@Published` 持有，protocol 介面透過 `Published<>.Publisher` 暴露（因為 protocol 不支援 `@Published`）
+- **ViewModel** 只儲存 UI 狀態（`@Published` 顯示狀態），**不自己持有 source of truth**；所有資料一律由 Interactor 同步而來，方式包含：
+  - 訂閱 Interactor 的 publisher（ViewModel 可以 `@Published` 一份對應的顯示 cache，但這份 cache 必須完全由 publisher 驅動，ViewModel 不自己 fetch / 維護）
+  - 直接讀 Interactor protocol 的 `get` property（同步取當下值）
+- **例外**：跟 UI 強相關、跟資料來源無關的「行為元件」可以擺在 ViewModel，例如 `AVProvider`（包 `AVPlayer` 播放音檔）
 - **ViewController** 是容器，持有 ViewModel 供 View 觀察
 
 ### 3. 弱引用規則
@@ -49,12 +52,26 @@ AppCoordinator → Coordinator → ViewController → ViewModel → Interactor
 - 具體型別只在 Coordinator 組裝時出現
 - 便於測試與解耦
 
+### 5. Coordinator 不儲存額外物件
+
+- **Coordinator 禁止把組裝出來的物件（Interactor、ViewModel、ViewController 等）存成自己的 property**
+- Coordinator 只儲存 `Coordinator` protocol 要求的屬性（`parentCoordinator`、`childCoordinators`）以及自身的 `rootViewController`、`navigator`
+- 組裝時機有兩種，依 init 是否接收 `navigator` 決定：
+  - **`start()` 中組裝**：Coordinator 自己建立 `UINavigationController`（模式 A），組裝放在 `start()`
+  - **`init` 中組裝**：Coordinator 從外部接收 `navigator`（模式 B），組裝可直接寫在 `init` 中
+- 組裝完成後由各層自行持有（VC 持有 VM、VM 持有 Interactor），Coordinator 不再保留 reference
+- 如果有特殊需求需要儲存額外物件，應明確說明原因
+- **例外**：`AppCoordinator` 可儲存全域 context（如 `window`），因為它管理 app 層級的生命週期
+
 **命名慣例：**
 - Coordinator protocol：`{功能名}CoordinatorProtocol`（如 `HomeCoordinatorProtocol`、`TabCoordinatorProtocol`）
-- Interactor protocol：`{功能名}InteractorProtocol`（如 `HomeInteractorProtocol`）
-- Interactor 實作：`{功能名}InteractorImpl`（如 `HomeInteractorImpl`）
+- Coordinator 實作：`{功能名}Coordinator`（如 `HomeCoordinator`、`TabCoordinator`）
+- Interactor protocol：`{功能名}Interactor`（如 `HomeInteractor`、`ItemListInteractor`）
+- Interactor 實作：`{功能名}InteractorImpl`（如 `HomeInteractorImpl`、`ItemListInteractorImpl`）
+- ViewModel：`{功能名}ViewModel`（如 `HomeViewModel`）
+- ViewController：`{功能名}ViewController`（如 `HomeViewController`）
 
-### 5. Publisher 轉發鏈
+### 6. Publisher 轉發鏈
 
 ```
 Interactor(@Published) → ViewModel(subscribe + transform) → View(@ObservedObject)
@@ -63,13 +80,23 @@ Interactor(@Published) → ViewModel(subscribe + transform) → View(@ObservedOb
 - ViewModel 在 `init` 中直接訂閱 Interactor 的 Publisher
 - 使用 `.receive(on: DispatchQueue.main)` 確保 UI 執行緒
 
-### 6. 檔案內容排列順序
+### 7. 導航統一由 Coordinator 處理
+
+- 所有 `push` / `present` 都必須透過 Coordinator 呼叫；View / ViewModel 不直接接觸 `UINavigationController` 或 `present(_:)`
+- ViewModel 透過 Coordinator protocol 觸發導航（如 `coordinator?.showDetail(id:)`）
+- **`pop`** 由 Coordinator 處理（透過 `navigator`）
+- **`dismiss`** 分兩種情況：
+  - 一般 modal 畫面（非透過 `presentCoordinator()` 推出）：由該 VC 或 View 自己 dismiss，Coordinator 不接 dismiss callback（避免反向傳遞）
+  - 透過 `presentCoordinator()` 推出的 child coordinator：必須由父 Coordinator 呼叫 `dismissCoordinator(_:animated:)` 回收（否則 `childCoordinators` 會殘留）
+
+### 8. 檔案內容排列順序
 
 每個 Swift 檔案內的成員按以下順序排列：
 
-1. **變數**（properties） — `@Published`、`weak var`、`private var`、`let` 等
-2. **`init`** — 初始化方法
-3. **func** — 方法（public/internal 在前，private 在後）
+1. **Nested types**（enum、struct 等內嵌型別） — 如 `TabCoordinator` 內的 `enum Tab`
+2. **變數**（properties） — `@Published`、`weak var`、`private var`、`let` 等
+3. **`init`** — 初始化方法
+4. **func** — 方法（public/internal 在前，private 在後）
 
 ---
 
@@ -223,7 +250,60 @@ PlayerDemo/              ← target 根目錄
 **職責：**
 - 定義 protocol 供 ViewModel 弱引用
 - 建立並組裝 ViewController + ViewModel + Interactor
-- 透過基礎設施的 `pushCoordinator()` / `presentCoordinator()` 管理畫面跳轉，child 生命週期由基礎設施自動管理
+- 透過 `navigator` push，或以自身 `rootViewController` 作為 presenting controller 呼叫 `present(...)` 彈出 modal（基礎設施提供 `pushCoordinator()` / `presentCoordinator()` 包好 child 生命週期管理）
+- **pop** 由 Coordinator 處理（透過 `navigator`）
+- **dismiss** 不在 Coordinator 處理，由該 VC 或 View 自行 dismiss
+
+**方法命名規則：**
+
+Coordinator 的方法名稱必須具體描述「要執行的動作」，而非描述「觸發的時機」：
+
+| Bad | Good | 原因 |
+|-----|------|------|
+| `didCreate()` | `showDetail(id:)` | 應描述做什麼，不是什麼時候觸發 |
+| `onComplete()` | `showMain()` | 同上 |
+| `handleTap()` | `showProfile(userID:)` | Coordinator 不處理 UI 事件，只處理導航 |
+| `next()` | `showPayment()` | 具體說明導航目標 |
+
+常見的動詞前綴：`show`（跳轉畫面）、`present`（modal 彈出）、`switch`（切換流程）
+
+**參數規則：**
+
+> 本規則只規範 Coordinator 的**導航方法**（`func showXxx`、`func presentXxx`）；Coordinator 本身的 `init` 不在此限——模式 B 的 `init(interactor:, navigator:)` 接 Interactor 是允許的。
+
+導航方法**傳遞資料物件，不傳遞 Interactor 本身**：
+
+| Bad | Good | 原因 |
+|-----|------|------|
+| `func showDetail(interactor: DetailInteractor)` | `func showDetail(itemID: String)` | Interactor 由方法內部建立，呼叫端不需要知道 Interactor 存在 |
+
+在方法內 init Interactor，再注入下一個 Coordinator：
+
+```swift
+func showDetail(itemID: String) {
+    let interactor = DetailInteractorImpl(itemID: itemID)
+    let coordinator = DetailCoordinator(interactor: interactor, navigator: navigator)
+    pushCoordinator(coordinator, animated: true)
+}
+```
+
+**Callback 例外：**
+
+導航方法預設不收 callback（結果應透過 Interactor 狀態回傳）。但確實有需要回傳系統元件結果的場景（如 `UIActivityViewController` 的分享結果），可以接 `@escaping` closure：
+
+```swift
+func showShare(items: [Any], onComplete: @escaping (String, Bool) -> Void) {
+    rootViewController.presentActivity(items: items) { type, complete in
+        onComplete(type, complete)
+    }
+}
+```
+
+**兩種 Coordinator init 模式：**
+
+**模式 A — 自己建立 NavigationController（根 Coordinator）：**
+
+Coordinator 自己建立 `UINavigationController` 作為 `rootViewController`，在 `start()` 中組裝 VC/VM/Interactor。適用於作為導航起點的 Coordinator（如 TabCoordinator 內的各 tab root）。
 
 ```swift
 protocol ItemCoordinatorProtocol: AnyObject {
@@ -236,9 +316,10 @@ class ItemCoordinator: NavigationCoordinator, ItemCoordinatorProtocol {
     weak var parentCoordinator: Coordinator?
     var childCoordinators: [Coordinator] = []
 
-    init(navigator: NavigatorType) {
-        self.navigator = navigator
-        self.rootViewController = UINavigationController()
+    init() {
+        let navigationController = UINavigationController()
+        self.navigator = Navigator(navigationController: navigationController)
+        self.rootViewController = navigationController
     }
 
     func start() {
@@ -249,8 +330,46 @@ class ItemCoordinator: NavigationCoordinator, ItemCoordinatorProtocol {
     }
 
     func showDetail(id: String) {
-        let detailCoordinator = ItemDetailCoordinator(itemID: id, navigator: navigator)
+        let interactor = ItemDetailInteractorImpl(itemID: id)
+        let detailCoordinator = ItemDetailCoordinator(interactor: interactor, navigator: navigator)
         pushCoordinator(detailCoordinator, animated: true)
+    }
+}
+```
+
+**模式 B — 接收外部 Navigator（子 Coordinator）：**
+
+Coordinator 從父層接收 `navigator`，在 `init` 中就完成 VC/VM/Interactor 的組裝，`start()` 留空。適用於被 `pushCoordinator()` 推入的子 Coordinator，因為 push 時基礎設施需要存取 `rootViewController`，所以必須在 `init` 階段就準備好。
+
+注意：因為 `init` 中 `self` 尚未完成初始化，ViewModel 的 coordinator 參數先傳 `nil`，init 結束後再補上 `self`。
+
+```swift
+protocol ItemDetailCoordinatorProtocol: AnyObject {
+    func showRelated(id: String)
+}
+
+class ItemDetailCoordinator: NavigationCoordinator, ItemDetailCoordinatorProtocol {
+    weak var parentCoordinator: Coordinator?
+    var childCoordinators: [Coordinator] = []
+    let rootViewController: UIViewController
+    let navigator: NavigatorType
+
+    init(interactor: ItemDetailInteractor, navigator: NavigatorType) {
+        self.navigator = navigator
+        let viewModel = ItemDetailViewModel(coordinator: nil, interactor: interactor)
+        let vc = ItemDetailViewController(viewModel: viewModel)
+        vc.hidesBottomBarWhenPushed = true
+        self.rootViewController = vc
+        viewModel.coordinator = self
+    }
+
+    func start() {
+    }
+
+    func showRelated(id: String) {
+        let interactor = ItemDetailInteractorImpl(itemID: id)
+        let relatedCoordinator = ItemDetailCoordinator(interactor: interactor, navigator: navigator)
+        pushCoordinator(relatedCoordinator, animated: true)
     }
 }
 ```
@@ -359,25 +478,31 @@ class TabCoordinator: NavigationCoordinator, TabCoordinatorProtocol {
 當子 Coordinator 需要 push 進父 Coordinator 的同一個 navigation stack 時（例如從列表頁 push 進詳情頁），子 Coordinator 接收父 Coordinator 的 `navigator`，在 `init` 中完成所有組裝，`start()` 為空。
 
 ```swift
-class DetailCoordinator: NavigationCoordinator {
+protocol DetailCoordinatorProtocol: AnyObject {
+    // 如有 detail 後續導航方法，宣告於此
+}
+
+class DetailCoordinator: NavigationCoordinator, DetailCoordinatorProtocol {
     weak var parentCoordinator: Coordinator?
     var childCoordinators: [Coordinator] = []
     let rootViewController: UIViewController
     let navigator: NavigatorType
 
-    init(interactor: DetailInteractorProtocol, navigator: NavigatorType) {
+    init(interactor: DetailInteractor, navigator: NavigatorType) {
         self.navigator = navigator
-        let viewModel = DetailViewModel(interactor: interactor)
+        let viewModel = DetailViewModel(coordinator: nil, interactor: interactor)
         let vc = DetailViewController(viewModel: viewModel)
         vc.hidesBottomBarWhenPushed = true
         self.rootViewController = vc
+        viewModel.coordinator = self
     }
 
     func start() {}
 }
 
 // 父 Coordinator 中使用
-func showDetail(interactor: DetailInteractorProtocol) {
+func showDetail(itemID: String) {
+    let interactor = DetailInteractorImpl(itemID: itemID)
     let coordinator = DetailCoordinator(interactor: interactor, navigator: navigator)
     pushCoordinator(coordinator, animated: true)
 }
@@ -720,6 +845,11 @@ class ItemListInteractorImpl: ItemListInteractor {
 | Interactor protocol 用 `@Published` | 用 `Published<>.Publisher` | Protocol 不支援 property wrapper |
 | Coordinator 在 ViewModel 中建立 | Coordinator 建立所有元件 | Coordinator 是唯一的組裝點 |
 | 在 ViewModel 中 import 第三方 SDK | 透過 Adapter/Provider 抽象 | 解耦第三方依賴 |
+| ViewModel / View 直接呼叫 `push` / `present` | 透過 `coordinator?.showXxx(...)` | 所有導航統一由 Coordinator 處理 |
+| Coordinator 把 Interactor 存成 property | Interactor 由各層自行持有，Coordinator 組裝完即放 | Coordinator 只負責組裝 |
+| 導航方法接收 Interactor 作為參數 | 接收 data 物件，方法內 init Interactor | 呼叫端不需要知道 Interactor 存在 |
+| ViewModel 自己持有 source of truth（自己 fetch / 維護資料） | 由 Interactor 持有，ViewModel 訂閱或讀 `get` property | 資料來源唯一性 |
+| 父 Coordinator 用 `presentCoordinator()` 推 child 後不 `dismissCoordinator()` | 對 `presentCoordinator()` 推出的 child 一律 `dismissCoordinator()` 回收 | 避免 `childCoordinators` 殘留 |
 
 ---
 
@@ -743,10 +873,10 @@ class ItemListInteractorImpl: ItemListInteractor {
 - 暴露 publisher：`var xxxPublisher: Published<Type>.Publisher { $xxx }`
 
 **Step 2 — ViewModel**
-- `ObservableObject`，持有 `@Published` 顯示狀態
+- `ObservableObject`，只持有 UI 狀態（不持有 source of truth）
 - `init` 注入 Coordinator protocol（weak）+ Interactor protocol
-- `init` 中訂閱 Interactor publisher，轉換為顯示資料
-- 提供 View 呼叫的 action 方法（導航交給 coordinator）
+- 取資料兩種方式：訂閱 Interactor publisher 轉換為顯示資料；或直接讀 Interactor 的 `get` property 同步取當下值
+- 提供 View 呼叫的 action 方法（導航一律呼叫 `coordinator?.showXxx(...)`，不直接 push / present）
 
 **Step 3 — ViewController**
 - 持有 ViewModel，承載 View
@@ -755,8 +885,10 @@ class ItemListInteractorImpl: ItemListInteractor {
 **Step 4 — Coordinator**
 - 定義 protocol（供 ViewModel 弱引用）
 - 實作類遵循 `NavigationCoordinator` 或 `PresentationCoordinator`
-- `start()` 中組裝：建立 Interactor → ViewModel → ViewController
-- 提供導航方法（push/present 其他 Coordinator）
+- 組裝（建立 Interactor → ViewModel → ViewController），組裝時機看是哪種模式：
+  - 模式 A（自己建 `UINavigationController`）：組裝放在 `start()`
+  - 模式 B（init 接外部 `navigator`）：組裝直接寫在 `init`
+- 提供導航方法（push / present 其他 Coordinator），方法接資料物件、方法內 init Interactor
 
 **Step 5 — 接入既有結構**
 - 在適當的父 Coordinator 中加入跳轉入口

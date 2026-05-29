@@ -1,9 +1,15 @@
 {
   "name": "mvvmci-ios",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "skill",
   "description": "iOS MVVM-C+I 架構規範 — Coordinator + MVVM + Interactor 分層原則與程式碼範本",
-  "keywords": ["ios", "swift", "mvvm", "coordinator", "architecture"],
+  "keywords": [
+    "ios",
+    "swift",
+    "mvvm",
+    "coordinator",
+    "architecture"
+  ],
   "author": {
     "name": "kevinkevinkuo",
     "github": "kevinkevinkuo"
