@@ -1,6 +1,6 @@
 {
   "name": "mvvmci-ios",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "skill",
   "description": "iOS MVVM-C+I 架構規範 — Coordinator + MVVM + Interactor 分層原則與程式碼範本",
   "keywords": [

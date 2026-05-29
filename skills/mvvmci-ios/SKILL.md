@@ -33,10 +33,17 @@ AppCoordinator → Coordinator → ViewController → ViewModel → Interactor
 
 ### 2. 狀態所有權
 
-- **Interactor** 是所有資料來源（data source）的擁有者：API 回傳的資料、業務狀態都在 Interactor 以 `@Published` 持有，protocol 介面透過 `Published<>.Publisher` 暴露（因為 protocol 不支援 `@Published`）
-- **ViewModel** 只儲存 UI 狀態（`@Published` 顯示狀態），**不自己持有 source of truth**；所有資料一律由 Interactor 同步而來，方式包含：
-  - 訂閱 Interactor 的 publisher（ViewModel 可以 `@Published` 一份對應的顯示 cache，但這份 cache 必須完全由 publisher 驅動，ViewModel 不自己 fetch / 維護）
-  - 直接讀 Interactor protocol 的 `get` property（同步取當下值）
+> Interactor 介面可以用以下幾種形式暴露資料 / 方法（詳見後方「Interactor」段落），**per data / per method 依實際需求選**，多種形式可在同一個 Interactor 並存：
+> - **Publisher 屬性**（`var xxxPublisher: Published<T>.Publisher { get }`）：需要持續推送給 UI 的狀態
+> - **Async throws 方法**（`func xxx(...) async throws -> T`）：一次性查詢、CRUD action、衍生查詢
+> - **Get property**（`var xxx: T { get }`）：需同步讀當下值
+>
+> 對於 publisher 暴露的資料，Interactor 是 source of truth；async method 則是 facade，呼叫一次拿一次。
+
+- **Interactor** 是業務邏輯與資料的入口：對於 publisher 暴露的資料，它持有 source of truth、以 `@Published` 維護；對於 async method 暴露的查詢/動作，它只是 facade
+- **ViewModel** 只儲存 UI 狀態（`@Published` 顯示狀態），**不自己持有 source of truth**；資料一律從 Interactor 同步而來：
+  - 對應 publisher 資料：訂閱 publisher（ViewModel 可 `@Published` 一份顯示 cache，但 cache 完全由 publisher 驅動，ViewModel 不自己 fetch / 維護）；或讀 protocol 的 `get` property 同步取當下值
+  - 對應 async method：在 ViewModel action 方法內 `await` 拿結果，再 assign 給 `@Published` 顯示資料
 - **例外**：跟 UI 強相關、跟資料來源無關的「行為元件」可以擺在 ViewModel，例如 `AVProvider`（包 `AVPlayer` 播放音檔）
 - **ViewController** 是容器，持有 ViewModel 供 View 觀察
 
@@ -51,12 +58,13 @@ AppCoordinator → Coordinator → ViewController → ViewModel → Interactor
 - Coordinator protocol、Interactor protocol 皆以 protocol 型別傳入
 - 具體型別只在 Coordinator 組裝時出現
 - 便於測試與解耦
+- Interactor 實作 `init` 通常採 default-value DI（如 `init(repository: ItemRepository = .shared)`），測試時注入 mock 即可替換
 
 ### 5. Coordinator 不儲存額外物件
 
 - **Coordinator 禁止把組裝出來的物件（Interactor、ViewModel、ViewController 等）存成自己的 property**
 - Coordinator 只儲存 `Coordinator` protocol 要求的屬性（`parentCoordinator`、`childCoordinators`）以及自身的 `rootViewController`、`navigator`
-- 組裝時機有兩種，依 init 是否接收 `navigator` 決定：
+- 組裝位置有兩種，依 init 是否接收 `navigator` 決定：
   - **`start()` 中組裝**：Coordinator 自己建立 `UINavigationController`（模式 A），組裝放在 `start()`
   - **`init` 中組裝**：Coordinator 從外部接收 `navigator`（模式 B），組裝可直接寫在 `init` 中
 - 組裝完成後由各層自行持有（VC 持有 VM、VM 持有 Interactor），Coordinator 不再保留 reference
@@ -72,6 +80,8 @@ AppCoordinator → Coordinator → ViewController → ViewModel → Interactor
 - ViewController：`{功能名}ViewController`（如 `HomeViewController`）
 
 ### 6. Publisher 轉發鏈
+
+> 本規則適用於 Interactor 用 publisher 暴露的資料。Async method 走 async / await 直接 return，沒有 publisher 轉發鏈。
 
 ```
 Interactor(@Published) → ViewModel(subscribe + transform) → View(@ObservedObject)
@@ -252,7 +262,9 @@ PlayerDemo/              ← target 根目錄
 - 建立並組裝 ViewController + ViewModel + Interactor
 - 透過 `navigator` push，或以自身 `rootViewController` 作為 presenting controller 呼叫 `present(...)` 彈出 modal（基礎設施提供 `pushCoordinator()` / `presentCoordinator()` 包好 child 生命週期管理）
 - **pop** 由 Coordinator 處理（透過 `navigator`）
-- **dismiss** 不在 Coordinator 處理，由該 VC 或 View 自行 dismiss
+- **dismiss** 分兩種情況：
+  - 一般 modal 畫面（非透過 `presentCoordinator()` 推出）：由該 VC 或 View 自行 dismiss
+  - 透過 `presentCoordinator()` 推出的 child coordinator：由父 Coordinator 呼叫 `dismissCoordinator(_:animated:)` 回收
 
 **方法命名規則：**
 
@@ -508,9 +520,119 @@ func showDetail(itemID: String) {
 }
 ```
 
-**何時自建 vs 共用 Navigator：**
-- **自建**：Tab 的根 Coordinator、獨立流程（如 Onboarding）— 需要自己的 `UINavigationController`
-- **共用**：同一個 navigation stack 內的子頁面 — 接收父 Coordinator 的 `navigator`，`init` 中組裝完畢，`start()` 為空
+**子畫面實作三條路怎麼選：**
+
+| 條件 | 自建 NavigationController | 共用 navigator + 獨立 child Coordinator | 共用 navigator + 父多 protocol |
+|------|--------------------------|----------------------------------------|--------------------------------|
+| 需要自己的 navigation stack | ✅ | ❌ | ❌ |
+| 屬於父的 navigation stack 延伸 | ❌ | ✅ | ✅ |
+| 子畫面有獨立子流程 / 會 push 自己的 child chain | ❌ | ✅ | ❌ |
+| 子畫面是輕量單畫面（push / pop / present 即可） | ❌ | 可以但較重 | ✅ |
+| 子畫面要被多入口 reuse | ✅（獨立流程） | ✅ | ✅（protocol 共用） |
+
+**典型場景：**
+- **自建 NavigationController**：Tab 的根 Coordinator、獨立流程（如 Onboarding）— 需要自己的 `UINavigationController`
+- **共用 navigator + 獨立 child Coordinator**：同一 navigation stack 內、但子畫面有自己的子流程或 child chain — 接收父 Coordinator 的 `navigator`，`init` 中組裝完畢，`start()` 為空（見「共用 Navigator 的子 Coordinator」）
+- **共用 navigator + 父多 protocol**：父功能流程包含多個輕量子畫面，不另建 Coordinator class，由父 Coordinator 直接實作各子畫面的 `CoordinatorProtocol`（見下方「多 protocol 實作」）
+
+**多 protocol 實作（一個 Coordinator 服務多個子畫面）：**
+
+當 Coordinator 管理的功能流程包含多個輕量子畫面（VC + VM 但不需要獨立 navigation flow），這些子畫面的 ViewModel 都需要呼叫導航時：
+- **不另建** 每個子畫面的 Coordinator class
+- 每個子畫面只有 protocol 檔（一個 `<Child>CoordinatorProtocol`），沒有對應的 Coordinator class
+- **父 Coordinator class 同時遵從主 protocol + 所有子畫面 protocol**
+- 子畫面 ViewModel init 時收 `coordinator: <Child>CoordinatorProtocol`，父 Coordinator 傳 `self` 即可
+
+```swift
+// 子畫面 A 的 protocol（檔名 ChildACoordinator.swift，但只含 protocol 宣告，無 class）
+protocol ChildACoordinatorProtocol: AnyObject {
+    func doSomething()
+}
+
+// 子畫面 B 的 protocol（檔名 ChildBCoordinator.swift）
+protocol ChildBCoordinatorProtocol: AnyObject {
+    func pop()
+}
+
+// 主功能 protocol
+protocol ParentCoordinatorProtocol: AnyObject {
+    func showChildA()
+    func showChildB()
+}
+
+// 父 Coordinator class —— 同時實作主 protocol 與多個子畫面 protocol
+class ParentCoordinator: NavigationCoordinator,
+                          ParentCoordinatorProtocol,
+                          ChildACoordinatorProtocol {
+
+    weak var parentCoordinator: Coordinator?
+    var childCoordinators: [Coordinator] = []
+    let rootViewController: UIViewController
+    let navigator: NavigatorType
+
+    init(navigator: NavigatorType, interactor: ParentInteractor) {
+        self.navigator = navigator
+        let viewModel = ParentViewModel(coordinator: nil, interactor: interactor)
+        self.rootViewController = ParentViewController(viewModel: viewModel)
+        viewModel.coordinator = self
+    }
+
+    func start() {}
+
+    // ParentCoordinatorProtocol
+    func showChildA() {
+        // 注意：coordinator: self —— self 因為實作了 ChildACoordinatorProtocol 自然 conform
+        let viewModel = ChildAViewModel(coordinator: self, interactor: ChildAInteractorImpl())
+        navigator.push(ChildAViewController(viewModel: viewModel), animated: true)
+    }
+
+    func showChildB() {
+        let viewModel = ChildBViewModel(coordinator: self, interactor: ChildBInteractorImpl())
+        navigator.push(ChildBViewController(viewModel: viewModel), animated: true)
+    }
+
+    // ChildACoordinatorProtocol
+    func doSomething() {
+        // ...
+    }
+}
+
+// 概念獨立的通用方法（如 pop）用 extension 分離提升可讀性
+extension ParentCoordinator: ChildBCoordinatorProtocol {
+    func pop() {
+        navigator.popViewController(animated: true)
+    }
+}
+```
+
+**子畫面 protocol 可被多個父 Coordinator 共用：**
+
+如果同一個子畫面會從多個入口進入（例如 A 頁與 B 頁都能 push 進同一個 child 頁面），該子畫面的 `CoordinatorProtocol` 可以被多個父 Coordinator 同時實作。每個父 Coordinator 自己 push 該畫面、自己 conform protocol 處理那畫面內的導航事件 — 子畫面 protocol 本身不綁定特定父。
+
+```swift
+class FlowACoordinator: NavigationCoordinator, FlowACoordinatorProtocol, SharedChildCoordinatorProtocol { ... }
+class FlowBCoordinator: NavigationCoordinator, FlowBCoordinatorProtocol, SharedChildCoordinatorProtocol { ... }
+```
+
+**核心適用情境：**
+- 子畫面屬於同一個功能流程的延伸，不需要獨立 navigation stack
+- 子畫面 ViewModel 只需要簡單的 push / pop / present / dismiss 等動作
+
+**進階延伸：** 同一份子畫面 `CoordinatorProtocol` 可被多個父 Coordinator 同時實作（前提是各父都用本模式）— 適合通用子畫面（如「分享」「VIP 升級」「設定提醒」等會從多入口進入的頁面）。
+
+**不適合多 protocol 的情況（應該獨立成 child Coordinator）：**
+- 子畫面是獨立流程：有自己的 navigation stack、會 push 自己的 child Coordinator chain、或有獨立生命週期管理需求
+- 多個 protocol 方法集合過大，導致父 Coordinator class 失焦
+
+**檔案結構慣例：**
+- 每個子畫面有自己的 protocol 檔：`<Child>CoordinatorProtocol` 宣告在 `<Child>Coordinator.swift` 中
+- 該檔只有 protocol 宣告，無 Coordinator class
+- 父 Coordinator class 跟著主功能命名
+
+**實作要點：**
+- 多 protocol 的方法可全寫在 class body 內，或按概念分群用 `extension` 分離
+- 子畫面 ViewModel init 時收的 coordinator 型別是 `<Child>CoordinatorProtocol`（不是父的具體 class），確保子畫面對父實作解耦
+- 若不同 protocol 有同名方法（如多個 protocol 都宣告 `pop()`），父 Coordinator 一份實作可同時 satisfy 多個 protocol
 
 ---
 
@@ -774,6 +896,8 @@ class ItemListViewController: UIViewController {
 
 轉發 Interactor 狀態、提供 View 的 action 方法、透過 Coordinator 處理導航。
 
+> 以下範例引用前面段落定義的 `ItemCoordinatorProtocol`（模式 A 範例）與 `ItemListInteractor`（Interactor 範例 1）。
+
 ```swift
 class ItemListViewModel: ObservableObject {
     @Published private(set) var items: [ItemViewObject] = []
@@ -811,7 +935,27 @@ class ItemListViewModel: ObservableObject {
 
 ### Interactor
 
-業務邏輯層，擁有狀態，透過 protocol 暴露 Publisher。
+業務邏輯層。介面可以用以下幾種形式暴露，**依實際需求自由組合**：
+
+- **Publisher 屬性**（`var xxxPublisher: Published<T>.Publisher { get }`）：對需要持續推送給 UI 的狀態使用；實作以 `@Published` 持有，這份資料 Interactor 即 source of truth
+- **Async throws 方法**（`func xxx(...) async throws -> T`）：對一次性查詢、CRUD action、衍生查詢使用；方法為純 facade，每次呼叫獨立 fetch / mutate
+- **Get property**（`var xxx: T { get }`）：對需同步讀當下值的場景使用；通常作為 publisher 狀態的同步讀法
+
+**依資料更新模式選擇形式（per data / per method）：**
+
+| 條件 | Publisher | Async method | Get property |
+|------|-----------|--------------|--------------|
+| 資料會隨時間變動、UI 要跟著動 | ✅ | ❌ | 搭配 publisher |
+| 一次性查詢 / 寫入後即可 | ❌ | ✅ | ❌ |
+| 多畫面共享同一份 state | ✅ | ❌ | 搭配 publisher |
+| 業務邏輯由多個 UseCase / Repository 組合 | 可以但較重 | ✅ 自然 | ❌ |
+| 同步取當下值（不訂閱） | ❌ | ❌ | ✅ |
+
+---
+
+#### 範例 1 — 純 publisher 介面（持續推送狀態）
+
+適用於即時列表更新、播放進度、推播狀態等場景。
 
 ```swift
 // Protocol — 用 Published<>.Publisher 暴露狀態
@@ -823,15 +967,101 @@ protocol ItemListInteractor {
 // 實作 — 用 @Published 持有狀態
 class ItemListInteractorImpl: ItemListInteractor {
     @Published private var items: [ItemDataModel] = []
-
     var itemsPublisher: Published<[ItemDataModel]>.Publisher { $items }
 
+    private let repository: ItemRepository
+
+    init(repository: ItemRepository = .shared) {
+        self.repository = repository
+    }
+
     func fetchItems() async throws {
-        let result = try await APIEngine.shared.getItems()
-        items = result
+        items = try await repository.fetchItems()
     }
 }
 ```
+
+#### 範例 2 — 純 async method 介面（method facade）
+
+適用於一次性查詢、CRUD action、share link 產生、quota 查詢等場景。protocol 宣告 `async throws` 方法；實作常 compose UseCase / Repository，init 採 default-value DI，測試時注入 mock。
+
+```swift
+// Protocol — 純 async 方法 facade
+protocol ItemActionInteractor {
+    func fetchItem(id: String) async throws -> ItemDTO
+    func deleteItem(id: String) async throws
+    func updateItem(id: String, title: String) async throws
+}
+
+// 實作 — stateless facade，compose UseCase
+class ItemActionInteractorImpl: ItemActionInteractor {
+    private let fetchUseCase: FetchItemUseCase
+    private let deleteUseCase: DeleteItemUseCase
+    private let updateUseCase: UpdateItemUseCase
+
+    init(repository: ItemRepository = .shared) {
+        self.fetchUseCase = .init(repository: repository)
+        self.deleteUseCase = .init(repository: repository)
+        self.updateUseCase = .init(repository: repository)
+    }
+
+    func fetchItem(id: String) async throws -> ItemDTO {
+        try await fetchUseCase.execute(id: id)
+    }
+
+    func deleteItem(id: String) async throws {
+        try await deleteUseCase.execute(id: id)
+    }
+
+    func updateItem(id: String, title: String) async throws {
+        try await updateUseCase.execute(id: id, title: title)
+    }
+}
+```
+
+#### 範例 3 — 混用介面（publisher + async method 並存）
+
+實務上同一個 Interactor 經常混用：列表狀態用 publisher 推送即時更新，CRUD action / 衍生查詢用 async method 一次性 return。
+
+```swift
+protocol ItemInteractor {
+    // Publisher：持續推送的 list 狀態
+    var itemsPublisher: Published<[ItemDataModel]>.Publisher { get }
+    func fetchItems() async throws
+
+    // Async method：一次性的 CRUD / 衍生查詢
+    func deleteItem(id: String) async throws
+    func getShareLink(id: String) async throws -> String?
+}
+
+class ItemInteractorImpl: ItemInteractor {
+    @Published private var items: [ItemDataModel] = []
+    var itemsPublisher: Published<[ItemDataModel]>.Publisher { $items }
+
+    private let deleteUseCase: DeleteItemUseCase
+    private let shareLinkUseCase: GetShareLinkUseCase
+
+    init(repository: ItemRepository = .shared) {
+        self.deleteUseCase = .init(repository: repository)
+        self.shareLinkUseCase = .init(repository: repository)
+    }
+
+    func fetchItems() async throws {
+        items = try await APIEngine.shared.getItems()
+    }
+
+    func deleteItem(id: String) async throws {
+        try await deleteUseCase.execute(id: id)
+        items.removeAll { $0.id == id }  // 同步寫回 publisher state
+    }
+
+    func getShareLink(id: String) async throws -> String? {
+        try await shareLinkUseCase.execute(id: id)
+    }
+}
+```
+
+**關於 state 同步：** 如果 async method 會影響 publisher 暴露的 state（如上例 `deleteItem` 刪掉 list 中對應 item），在方法 body 內手動同步 `@Published` state，讓 publisher 自動推送更新。
 
 ---
 
@@ -850,6 +1080,8 @@ class ItemListInteractorImpl: ItemListInteractor {
 | 導航方法接收 Interactor 作為參數 | 接收 data 物件，方法內 init Interactor | 呼叫端不需要知道 Interactor 存在 |
 | ViewModel 自己持有 source of truth（自己 fetch / 維護資料） | 由 Interactor 持有，ViewModel 訂閱或讀 `get` property | 資料來源唯一性 |
 | 父 Coordinator 用 `presentCoordinator()` 推 child 後不 `dismissCoordinator()` | 對 `presentCoordinator()` 推出的 child 一律 `dismissCoordinator()` 回收 | 避免 `childCoordinators` 殘留 |
+| 為一次性 fetch / CRUD 硬塞 `@Published` state + Publisher | 改用 `async throws` 方法直接 return | 無持續更新需求時，publisher 反而增加複雜度 |
+| async method 內藏隱性 cache state（每次 call 結果不同） | cache 移到 ViewModel / Repository；method 保持 stateless | 同一個 Interactor 內的 async method 應該是純 facade |
 
 ---
 
@@ -867,10 +1099,12 @@ class ItemListInteractorImpl: ItemListInteractor {
 
 按此順序生成，每一步完成後再進行下一步：
 
-**Step 1 — Interactor**
-- 定義 protocol，宣告 `Published<>.Publisher` 屬性與方法
-- 建立實作類，以 `@Published` 持有業務狀態
-- 暴露 publisher：`var xxxPublisher: Published<Type>.Publisher { $xxx }`
+**Step 1 — Interactor（per data / per method 選介面形式）**
+- 對每個資料 / 方法分別判斷介面形式：需要持續推給 UI / 多畫面共享 → publisher；一次性 fetch / CRUD / 衍生查詢 → async method；同步取當下值 → get property。多種形式可在同一個 Interactor 並存。
+- **Publisher 屬性**：protocol 宣告 `Published<>.Publisher`；實作以 `@Published` 持有狀態並暴露 `var xxxPublisher: Published<Type>.Publisher { $xxx }`
+- **Async throws 方法**：protocol 宣告 `async throws`；實作 init 用 default-value DI（如 `init(repository: ItemRepository = .shared)`），方法 body compose UseCase / Repository
+- **Get property**：protocol 宣告 `var xxx: T { get }`；實作通常 return `@Published` state 的當下值（如 `var current: Foo { foo }` 對應 `@Published private var foo`），給不需訂閱的場景同步讀
+- 若 async method 會改變 publisher state，方法內手動同步 `@Published` state
 
 **Step 2 — ViewModel**
 - `ObservableObject`，只持有 UI 狀態（不持有 source of truth）
@@ -885,10 +1119,11 @@ class ItemListInteractorImpl: ItemListInteractor {
 **Step 4 — Coordinator**
 - 定義 protocol（供 ViewModel 弱引用）
 - 實作類遵循 `NavigationCoordinator` 或 `PresentationCoordinator`
-- 組裝（建立 Interactor → ViewModel → ViewController），組裝時機看是哪種模式：
+- 組裝（建立 Interactor → ViewModel → ViewController），組裝位置看是哪種模式：
   - 模式 A（自己建 `UINavigationController`）：組裝放在 `start()`
   - 模式 B（init 接外部 `navigator`）：組裝直接寫在 `init`
 - 提供導航方法（push / present 其他 Coordinator），方法接資料物件、方法內 init Interactor
+- 若新畫面是既有功能的輕量子畫面（同 navigation stack、不需要獨立流程），可不另建 Coordinator，改成讓父 Coordinator 額外實作此畫面的 `CoordinatorProtocol`（見「多 protocol 實作」段落）
 
 **Step 5 — 接入既有結構**
 - 在適當的父 Coordinator 中加入跳轉入口
